@@ -18,115 +18,19 @@ if (-not $Username) { $Username = "RemoteAdmin" }
 if (-not $Password) { $Password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force }
 $SecurePassword = $Password
 
-# Compatibility helpers for older Windows (Windows 7)
-function CmdletExists($name) { return $null -ne (Get-Command $name -ErrorAction SilentlyContinue) }
-
-function UserExists($name) {
-    if (CmdletExists 'Get-LocalUser') { return $null -ne (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) }
-    try { & net user $name > $null 2>&1; return $LASTEXITCODE -eq 0 } catch { return $false }
-}
-
-function CreateLocalUserCompat($name, $securePwd, $fullName) {
-    if (CmdletExists 'New-LocalUser') {
-        New-LocalUser -Name $name -Password $securePwd -FullName $fullName -Description "Account for remote PowerShell access" -PasswordNeverExpires -AccountNeverExpires
-    } else {
-        # Fallback to net user; we need plaintext password for net user
-    # Cannot convert SecureString to plaintext without key; prompt for plaintext password
-    Write-Host "Creating user via net user fallback. Prompting for plaintext password because net user requires it."
-    $plaintextSecure = Read-Host "Enter plaintext password to set for user $name" -AsSecureString
-    $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($plaintextSecure))
-        & net user $name $plainPwd /add /fullname:"$fullName" /passwordreq:yes
-        # set password to never expire
-        try { wmic useraccount where name="$name" set PasswordExpires=False > $null 2>&1 } catch {}
-    }
-}
-
-function AddUserToAdminsCompat($name) {
-    if (CmdletExists 'Add-LocalGroupMember') { Add-LocalGroupMember -Group 'Administrators' -Member $name } else { & net localgroup "Administrators" $name /add }
-}
-
-function RemoveLocalUserCompat($name) {
-    if (CmdletExists 'Remove-LocalUser') { Remove-LocalUser -Name $name -ErrorAction Stop } else { & net user $name /delete }
-}
-
-function EnsureFirewallRuleWinRM() {
-    if (CmdletExists 'Get-NetFirewallRule') {
-        if (-not (Get-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName "WinRM HTTP-In" -Name "WINRM-HTTP-In-TCP" -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any -ErrorAction SilentlyContinue
-        } else { Enable-NetFirewallRule -Name "WINRM-HTTP-In-TCP" }
-    } else {
-        # netsh fallback
-        try { & netsh advfirewall firewall add rule name="WINRM-HTTP-In-TCP" dir=in action=allow protocol=TCP localport=5985 } catch {}
-    }
-}
-
-function DisableFirewallRuleWinRM() {
-    if (CmdletExists 'Get-NetFirewallRule') {
-        if (Get-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -ErrorAction SilentlyContinue) { Disable-NetFirewallRule -Name "WINRM-HTTP-In-TCP" }
-    } else {
-        try { & netsh advfirewall firewall delete rule name="WINRM-HTTP-In-TCP" protocol=TCP localport=5985 } catch {}
-    }
-}
-
-function SetTrustedHosts($value) {
-    try {
-        if (Test-Path WSMan:\localhost\Client) { Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value $value -Force; return }
-    } catch {}
-    # Fallback to winrm.exe
-    try { & winrm set winrm/config/client @{TrustedHosts="$value"} } catch {}
-}
-
-function SetWinRMConfig($serviceAllowUnencrypted, $serviceAuthBasic, $clientAllowUnencrypted, $clientAuthBasic) {
-    # Try WSMan provider, otherwise use winrm set
-    try {
-        if (Test-Path WSMan:\localhost\Service) {
-            Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $serviceAllowUnencrypted -Force
-            Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $serviceAuthBasic -Force
-        } else { throw "No WSMan service provider" }
-    } catch {
-        try { & winrm set winrm/config/service @{AllowUnencrypted="$serviceAllowUnencrypted"} } catch {}
-        try { & winrm set winrm/config/service/auth @{Basic="$serviceAuthBasic"} } catch {}
-    }
-    try {
-        if (Test-Path WSMan:\localhost\Client) {
-            Set-Item -Path WSMan:\localhost\Client\AllowUnencrypted -Value $clientAllowUnencrypted -Force
-            Set-Item -Path WSMan:\localhost\Client\Auth\Basic -Value $clientAuthBasic -Force
-        } else { throw "No WSMan client provider" }
-    } catch {
-        try { & winrm set winrm/config/client @{AllowUnencrypted="$clientAllowUnencrypted"} } catch {}
-        try { & winrm set winrm/config/client/auth @{Basic="$clientAuthBasic"} } catch {}
-    }
-}
-
-function GetLocalIPv4Addresses() {
-    if (CmdletExists 'Get-NetIPAddress') {
-        return (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.InterfaceAlias -notlike 'Loopback*' }).IPAddress
-    } else {
-        $cfgs = Get-WmiObject -Class Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled }
-        $ips = @()
-        foreach ($c in $cfgs) { if ($c.IPAddress) { $ips += $c.IPAddress } }
-        return $ips | Where-Object { $_ -notlike '127.*' -and $_ -notlike '169.254.*' }
-    }
-}
-
 switch ($remoteMgmt) {
     '1' {
         # Create the user account if it doesn't exist, or offer to reset the password
         try {
-            if (-not (UserExists $Username)) {
-                CreateLocalUserCompat -name $Username -securePwd $SecurePassword -fullName "Remote Admin User"
+            if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+                New-LocalUser -Name $Username -Password $SecurePassword -FullName "Remote Admin User" -Description "Account for remote PowerShell access" -PasswordNeverExpires -AccountNeverExpires
                 Write-Host "User $Username created."
             } else {
                 Write-Host "User $Username already exists."
                 $reset = Read-Host "Do you want to reset the password for $Username to the configured value? (y/N)"
                 if ($reset -match '^[Yy]') {
                     try {
-                        if (CmdletExists 'Set-LocalUser') { Set-LocalUser -Name $Username -Password $SecurePassword -ErrorAction Stop } else {
-                            # fallback to net user to set password
-                            $plain = Read-Host "Set password for $Username - enter plaintext password now" -AsSecureString
-                            $plainText = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($plain))
-                            & net user $Username $plainText
-                        }
+                        Set-LocalUser -Name $Username -Password $SecurePassword -ErrorAction Stop
                         Write-Host "Password for $Username has been reset."
                     } catch {
                         Write-Warning ("Failed to reset password for {0}: {1}" -f $Username, $_)
@@ -140,8 +44,14 @@ switch ($remoteMgmt) {
 
         # Add user to Administrators group if not already a member
         try {
-            AddUserToAdminsCompat -name $Username
-            Write-Host "$Username added to Administrators group (or was already a member)."
+            $accountName = "$($env:COMPUTERNAME)\$Username"
+            $inAdmins = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $accountName -or $_.Name -eq $Username }
+            if (-not $inAdmins) {
+                Add-LocalGroupMember -Group "Administrators" -Member $Username
+                Write-Host "$Username added to Administrators group."
+            } else {
+                Write-Host "$Username is already a member of Administrators group."
+            }
         } catch {
             Write-Warning ("Failed to add user {0} to Administrators: {1}" -f $Username, $_)
         }

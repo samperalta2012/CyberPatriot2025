@@ -58,15 +58,17 @@ $sessionMeta = @{ ComputerName = $ComputerName; Transport = 'WinRM'; Username = 
     try {
         # Always embed plaintext credentials into the script for lab testing
         $plain = if ($PlainPassword) { $PlainPassword } else { $EmbeddedPlainPassword }
+        # Escape single quotes so the embedded literal does not break the script
+        $plainForEmbed = $plain -replace "'", "''"
+        $userForEmbed  = $Username -replace "'", "''"
         $scriptPath = $MyInvocation.MyCommand.Definition
         $raw = Get-Content -Path $scriptPath -Raw
-        $start = '# <EMBEDDED_CREDENTIALS_START>
-$EmbeddedUsername = 'RemoteAdmin'
-$EmbeddedPlainPassword = 'P@ssw0rd123!'
-# <EMBEDDED_CREDENTIALS_END>'
-        $replacement = "$start`n`$EmbeddedUsername = '$Username'`n`$EmbeddedPlainPassword = '$plain'`n$end"
+        $start = '# <EMBEDDED_CREDENTIALS_START>'
+        $end   = '# <EMBEDDED_CREDENTIALS_END>'
+        $replacement = "$start`n`$EmbeddedUsername = '$userForEmbed'`n`$EmbeddedPlainPassword = '$plainForEmbed'`n$end"
         if ($raw -match [regex]::Escape($start)) {
-            $new = [regex]::Replace($raw, [regex]::Escape($start) + '.*?' + [regex]::Escape($end), $replacement, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            $pattern = [regex]::Escape($start) + '.*?' + [regex]::Escape($end)
+            $new = [regex]::Replace($raw, $pattern, $replacement, [System.Text.RegularExpressions.RegexOptions]::Singleline)
             Set-Content -Path $scriptPath -Value $new -Force
             Write-Host "Embedded plaintext credentials written into script: $scriptPath"
             $sessionMeta.CredFile = ''
